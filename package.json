@@ -1,5 +1,10 @@
 {
   "name": "kenneth-munachimso-chatbot",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "docx": "^9.5.1",
+    "jszip": "^3.10.1",
+    "pdfkit": "^0.17.2"
+  }
 }
