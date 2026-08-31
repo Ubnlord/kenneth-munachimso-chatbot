@@ -1,5 +1,8 @@
 {
-  "name": "kenneth-ai-proxy",
-  "version": "1.0.0",
-  "private": true
+  "name": "kenneth-munachimso-chatbot-proxy",
+  "version": "2.0.0",
+  "type": "module",
+  "dependencies": {
+    "@huggingface/inference": "latest"
+  }
 }
