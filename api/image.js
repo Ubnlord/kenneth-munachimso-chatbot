@@ -1,36 +1,36 @@
-// Vercel Serverless Function - Hugging Face Image Proxy
+// Vercel Serverless Function - Hugging Face Inference Providers Image Proxy
+// Uses explicit provider routes instead of the deprecated hf-inference route.
 
-const DEFAULT_MODEL = 'black-forest-labs/FLUX.1-dev';
-const FALLBACK_MODEL = 'Qwen/Qwen-Image';
+const PRIMARY = {
+  name: 'fal-ai/FLUX.1-schnell',
+  endpoint: 'https://router.huggingface.co/fal-ai/fal-ai/flux/schnell'
+};
+
+const FALLBACK = {
+  name: 'fal-ai/FLUX.1-dev',
+  endpoint: 'https://router.huggingface.co/fal-ai/fal-ai/flux/dev'
+};
+
 const RETRY_DELAYS_MS = [900, 1800];
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function normalizeModel(model) {
-  if (!model || typeof model !== 'string') return DEFAULT_MODEL;
-  const value = model.trim();
-  if (value === 'black-forest-labs/FLUX.1-schnell') return DEFAULT_MODEL;
-  return value;
-}
-
-async function generateImage({ apiKey, model, prompt }) {
-  // Use the Hugging Face Inference Providers text-to-image endpoint.
-  // :fastest lets the router select an available provider instead of
-  // forcing the deprecated hf-inference serverless route.
-  const endpoint = `https://router.huggingface.co/hf-inference/models/${encodeURIComponent(model)}`;
-
-  const response = await fetch(endpoint, {
+async function generateImage({ apiKey, provider, prompt }) {
+  return fetch(provider.endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`
     },
-    body: JSON.stringify({ inputs: prompt })
+    body: JSON.stringify({
+      prompt,
+      image_size: 'square_hd',
+      num_inference_steps: provider === PRIMARY ? 4 : 28,
+      output_format: 'png'
+    })
   });
-
-  return response;
 }
 
 async function parseError(response) {
@@ -41,6 +41,27 @@ async function parseError(response) {
   } catch {
     return text || `Hugging Face returned HTTP ${response.status}`;
   }
+}
+
+async function responseToImage(response) {
+  const contentType = response.headers.get('content-type') || '';
+
+  // Some providers return the image bytes directly.
+  if (contentType.startsWith('image/')) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return `data:${contentType};base64,${buffer.toString('base64')}`;
+  }
+
+  // Other providers return JSON containing an image URL.
+  const data = await response.json();
+  const url = data?.images?.[0]?.url || data?.image?.url || data?.url || data?.data?.[0]?.url;
+  if (url) return url;
+
+  // Also support a base64 image returned by a provider.
+  const b64 = data?.images?.[0]?.b64_json || data?.b64_json || data?.data?.[0]?.b64_json;
+  if (b64) return `data:image/png;base64,${b64}`;
+
+  throw new Error('Image provider returned a successful response without an image.');
 }
 
 export default async function handler(req, res) {
@@ -62,38 +83,31 @@ export default async function handler(req, res) {
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   if (!prompt) return res.status(400).json({ error: 'Image prompt is required.' });
 
-  const requestedModel = normalizeModel(body.model);
-  const modelsToTry = [requestedModel];
-  if (requestedModel !== FALLBACK_MODEL) modelsToTry.push(FALLBACK_MODEL);
-
+  const providers = [PRIMARY, FALLBACK];
   let lastError = null;
 
   try {
-    for (const model of modelsToTry) {
+    for (const provider of providers) {
       for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-        const response = await generateImage({ apiKey, model, prompt });
+        const response = await generateImage({ apiKey, provider, prompt });
 
         if (response.ok) {
-          const contentType = response.headers.get('content-type') || 'image/png';
-          const buffer = Buffer.from(await response.arrayBuffer());
+          const imageUrl = await responseToImage(response);
           return res.status(200).json({
-            data: [{ url: `data:${contentType};base64,${buffer.toString('base64')}` }],
+            data: [{ url: imageUrl }],
             _proxy: {
-              provider: 'huggingface-inference-providers',
-              model,
-              fallbackUsed: model !== requestedModel
+              provider: provider.name,
+              fallbackUsed: provider !== PRIMARY
             }
           });
         }
 
         lastError = {
           error: String(await parseError(response)),
-          model,
+          provider: provider.name,
           status: response.status
         };
 
-        // Retry temporary provider overloads. A deprecated/unsupported model
-        // (410), auth error (401/403), or bad request moves directly to fallback.
         const transient = response.status === 429 || response.status >= 500;
         if (!transient || attempt === RETRY_DELAYS_MS.length) break;
         await sleep(RETRY_DELAYS_MS[attempt]);
@@ -101,11 +115,10 @@ export default async function handler(req, res) {
     }
 
     return res.status(lastError?.status || 502).json({
-      error: lastError?.error || 'All Hugging Face image models/providers failed.',
-      model: lastError?.model,
-      provider: 'huggingface-inference-providers',
+      error: lastError?.error || 'All Hugging Face image providers failed.',
+      provider: lastError?.provider,
       status: lastError?.status,
-      fallbackAttempted: modelsToTry.length > 1
+      fallbackAttempted: true
     });
   } catch (err) {
     return res.status(500).json({
